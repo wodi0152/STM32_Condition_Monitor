@@ -1,0 +1,19 @@
+
+# STM32CubeIDE build outputs
+Debug/
+Release/
+build/
+
+# Eclipse workspace
+.metadata/
+.metadata*/
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*~
+Thumbs.db
+
+# Python cache
+__pycache__/
