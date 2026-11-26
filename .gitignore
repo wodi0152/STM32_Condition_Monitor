@@ -1,19 +1,40 @@
+# STM32CubeIDE build output
+/Debug/
+/Release/
+**/Debug/
+**/Release/
+*.elf
+*.map
+*.list
+*.o
+*.d
+*.su
+*.cyclo
 
-# STM32CubeIDE build outputs
-Debug/
-Release/
-build/
-
-# Eclipse workspace
+# Workspace and editor state
 .metadata/
-.metadata*/
-*.log
-
-# Temporary files
-*.tmp
+.settings/
+.vscode/
+.idea/
 *.bak
+*.tmp
+*.swp
 *~
-Thumbs.db
 
-# Python cache
+# Python runtime and virtual environments
 __pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+
+# User-generated measurements and logs
+*.log
+*.csv
+logs/
+measurements/
+
+# OS files
+.DS_Store
+Thumbs.db

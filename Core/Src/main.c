@@ -50,30 +50,54 @@ I2C_HandleTypeDef hi2c1;
 TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_usart2_rx;
 
 /* USER CODE BEGIN PV */
-static int16_t mon_shunt_raw = 0;
-volatile uint8_t oled_address = 0;
-volatile uint8_t ina219_found = 0;
-volatile uint8_t mpu6050_found = 0;
 
-uint32_t adc_value = 0;
-uint32_t pot_percent = 0;
-uint32_t pwm_percent = 0;
 
-char oled_text[32];
+/* Motor and potentiometer */
+static uint32_t adc_value = 0;
+static uint32_t pot_percent = 0;
+static uint32_t pwm_percent = 0;
 
-/* Sensor readings */
-static int32_t mon_ax = 0, mon_ay = 0, mon_az = 0;
+/* INA219 */
+static uint8_t ina219_found = 0;
+static uint8_t mon_ina_ok = 0;
 static uint32_t mon_bus_mv = 0;
 static int32_t mon_current_ma = 0;
-static int32_t mon_temp10 = 0;
+static int16_t mon_shunt_raw = 0;
 
+/* MPU6050 */
+static uint8_t mpu6050_found = 0;
 static uint8_t mon_mpu_ok = 0;
-static uint8_t mon_ina_ok = 0;
+
+static int32_t mon_ax = 0;
+static int32_t mon_ay = 0;
+static int32_t mon_az = 0;
+
+/* DS18B20 */
+static int32_t mon_temp10 = 0;
 static uint8_t mon_temp_ok = 0;
 static uint8_t mon_ds_busy = 0;
 static uint32_t mon_ds_stamp = 0;
+
+/* Vibration RMS */
+static uint32_t vib_rms_mg = 0;
+static uint8_t vib_ready = 0;
+static uint32_t vib_fifo_overflows = 0;
+
+static int64_t vib_sum_x = 0;
+static int64_t vib_sum_y = 0;
+static int64_t vib_sum_z = 0;
+
+static int64_t vib_sq_x = 0;
+static int64_t vib_sq_y = 0;
+static int64_t vib_sq_z = 0;
+
+static uint16_t vib_count = 0;
+static uint32_t mpu_retry_ms = 0;
+
+static uint32_t telemetry_last_ms = 0;
 
 
 /* USER CODE END PV */
@@ -81,6 +105,7 @@ static uint32_t mon_ds_stamp = 0;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM3_Init(void);
@@ -92,14 +117,21 @@ static void MX_USART2_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/* Shunt resistor: 100 mOhm if marked R100.
-   Check actual resistor marking before trusting mA. */
-#define INA_SHUNT_MOHM 100
+/* ===== SENSOR ADDRESSES ===== */
 
-/* Microsecond delay using Cortex-M4 DWT */
+#define INA219_ADDR   (0x40 << 1)
+#define MPU6050_ADDR  (0x68 << 1)
+
+#define VIB_WINDOW 200U
+#define VIB_BATCH  24U
+
+/* ===== MICROSECOND DELAY ===== */
+
 static void MON_DelayUs(uint32_t us)
 {
-    uint32_t cycles = (SystemCoreClock / 1000000U) * us;
+    uint32_t cycles =
+        (SystemCoreClock / 1000000U) * us;
+
     uint32_t start = DWT->CYCCNT;
 
     while ((uint32_t)(DWT->CYCCNT - start) < cycles)
@@ -107,7 +139,8 @@ static void MON_DelayUs(uint32_t us)
     }
 }
 
-/* DS18B20 1-Wire, A8, open-drain */
+/* ===== DS18B20 / 1-WIRE ===== */
+
 static void OW_Low(void)
 {
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
@@ -122,22 +155,25 @@ static uint8_t OW_Reset(void)
 {
     OW_Low();
     MON_DelayUs(480);
+
     OW_Release();
     MON_DelayUs(70);
 
     uint8_t present =
-        HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_RESET;
+        (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_RESET);
 
     MON_DelayUs(410);
+
     return present;
 }
 
 static void OW_WriteBit(uint8_t bit)
 {
-    uint32_t mask = __get_PRIMASK();
+    uint32_t primask = __get_PRIMASK();
     __disable_irq();
 
     OW_Low();
+
     if (bit)
     {
         MON_DelayUs(6);
@@ -151,25 +187,29 @@ static void OW_WriteBit(uint8_t bit)
         MON_DelayUs(10);
     }
 
-    if (mask == 0U) __enable_irq();
+    if (primask == 0U)
+        __enable_irq();
 }
 
 static uint8_t OW_ReadBit(void)
 {
-    uint32_t mask = __get_PRIMASK();
+    uint32_t primask = __get_PRIMASK();
     __disable_irq();
 
     OW_Low();
     MON_DelayUs(3);
+
     OW_Release();
     MON_DelayUs(12);
 
     uint8_t bit =
-        HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_SET;
+        (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_8) == GPIO_PIN_SET);
 
     MON_DelayUs(55);
 
-    if (mask == 0U) __enable_irq();
+    if (primask == 0U)
+        __enable_irq();
+
     return bit;
 }
 
@@ -187,7 +227,9 @@ static uint8_t OW_ReadByte(void)
     uint8_t value = 0;
 
     for (uint8_t i = 0; i < 8; i++)
-        value |= OW_ReadBit() << i;
+    {
+        value |= (uint8_t)(OW_ReadBit() << i);
+    }
 
     return value;
 }
@@ -203,109 +245,107 @@ static uint8_t OW_CRC8(const uint8_t *data, uint8_t len)
         for (uint8_t j = 0; j < 8; j++)
         {
             uint8_t mix = (crc ^ value) & 1U;
+
             crc >>= 1;
-            if (mix) crc ^= 0x8C;
+
+            if (mix)
+                crc ^= 0x8C;
+
             value >>= 1;
         }
     }
+
     return crc;
 }
 
-/* Non-blocking DS18B20 temperature measurement.
-   Assumes one externally powered sensor on A8. */
 static void MON_DS18B20_Task(void)
 {
     uint32_t now = HAL_GetTick();
 
     if (!mon_ds_busy)
     {
-        if ((uint32_t)(now - mon_ds_stamp) >= 1000U)
-        {
-            mon_ds_stamp = now;
+        if ((uint32_t)(now - mon_ds_stamp) < 1000U)
+            return;
 
-            if (OW_Reset())
-            {
-                OW_WriteByte(0xCC); // Skip ROM
-                OW_WriteByte(0x44); // Convert T
-                mon_ds_busy = 1;
-            }
-            else
-            {
-                mon_temp_ok = 0;
-            }
+        mon_ds_stamp = now;
+
+        if (!OW_Reset())
+        {
+            mon_temp_ok = 0;
+            return;
         }
+
+        OW_WriteByte(0xCC);
+        OW_WriteByte(0x44);
+
+        mon_ds_busy = 1;
     }
-    else if ((uint32_t)(now - mon_ds_stamp) >= 800U)
+    else
     {
+        if ((uint32_t)(now - mon_ds_stamp) < 800U)
+            return;
+
         mon_ds_busy = 0;
         mon_temp_ok = 0;
 
-        if (!OW_Reset()) return;
+        if (!OW_Reset())
+            return;
 
         OW_WriteByte(0xCC);
-        OW_WriteByte(0xBE); // Read scratchpad
+        OW_WriteByte(0xBE);
 
         uint8_t data[9];
 
         for (uint8_t i = 0; i < 9; i++)
+        {
             data[i] = OW_ReadByte();
+        }
 
-        if (OW_CRC8(data, 8) != data[8]) return;
+        if (OW_CRC8(data, 8) != data[8])
+            return;
 
-        int16_t raw =
-            (int16_t)(((uint16_t)data[1] << 8) | data[0]);
+        int16_t raw = (int16_t)(
+            ((uint16_t)data[1] << 8) | data[0]
+        );
 
         mon_temp10 = ((int32_t)raw * 10) / 16;
         mon_temp_ok = 1;
     }
 }
 
-/* Read MPU6050 acceleration, units: mg */
-static void MON_ReadMPU(void)
-{
-    uint8_t data[6];
+/* ===== INA219 ===== */
 
-    mon_mpu_ok = (HAL_I2C_Mem_Read(
-        &hi2c1, 0x68 << 1, 0x3B,
-        I2C_MEMADD_SIZE_8BIT, data, 6, 100) == HAL_OK);
-
-    if (!mon_mpu_ok) return;
-
-    int16_t x = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
-    int16_t y = (int16_t)(((uint16_t)data[2] << 8) | data[3]);
-    int16_t z = (int16_t)(((uint16_t)data[4] << 8) | data[5]);
-
-    mon_ax = ((int32_t)x * 1000) / 16384;
-    mon_ay = ((int32_t)y * 1000) / 16384;
-    mon_az = ((int32_t)z * 1000) / 16384;
-}
-
-/* Read a 16-bit INA219 register */
 static uint8_t MON_INAReg(uint8_t reg, uint16_t *value)
 {
     uint8_t data[2];
 
     if (HAL_I2C_Mem_Read(
-        &hi2c1, 0x40 << 1, reg,
-        I2C_MEMADD_SIZE_8BIT, data, 2, 100) != HAL_OK)
+        &hi2c1,
+        INA219_ADDR,
+        reg,
+        I2C_MEMADD_SIZE_8BIT,
+        data,
+        2,
+        100
+    ) != HAL_OK)
+    {
         return 0;
+    }
 
     *value = ((uint16_t)data[0] << 8) | data[1];
+
     return 1;
 }
-
 
 static void MON_ReadINA(void)
 {
     uint16_t bus_raw = 0;
     uint16_t shunt_raw = 0;
-    uint16_t current_raw = 0;
 
     uint8_t ok_bus = MON_INAReg(0x02, &bus_raw);
     uint8_t ok_shunt = MON_INAReg(0x01, &shunt_raw);
-    uint8_t ok_current = MON_INAReg(0x04, &current_raw);
 
-    mon_ina_ok = ok_bus && ok_shunt && ok_current;
+    mon_ina_ok = ok_bus && ok_shunt;
 
     if (!mon_ina_ok)
     {
@@ -315,17 +355,369 @@ static void MON_ReadINA(void)
         return;
     }
 
-    /* Bus voltage in millivolts */
     mon_bus_mv = (bus_raw >> 3) * 4U;
 
-    /* Raw shunt voltage: 10 uV per bit */
     mon_shunt_raw = (int16_t)shunt_raw;
 
-    /* Current register: 0.1 mA per bit */
-    mon_current_ma =
-        ((int32_t)(int16_t)current_raw) / 10;
+    /* Shunt R100 = 0.1 Ohm */
+    /* 1 raw bit = 0.1 mA */
+
+    mon_current_ma = (int32_t)mon_shunt_raw / 10;
 }
 
+/* ===== MPU6050 REGISTERS ===== */
+
+static uint8_t MPU_WriteReg(uint8_t reg, uint8_t value)
+{
+    return (
+        HAL_I2C_Mem_Write(
+            &hi2c1,
+            MPU6050_ADDR,
+            reg,
+            I2C_MEMADD_SIZE_8BIT,
+            &value,
+            1,
+            100
+        ) == HAL_OK
+    );
+}
+
+/* ===== INTEGER SQUARE ROOT ===== */
+
+static uint32_t VIB_Sqrt64(uint64_t number)
+{
+    uint64_t result = 0;
+    uint64_t bit = (uint64_t)1 << 62;
+
+    while (bit > number)
+        bit >>= 2;
+
+    while (bit != 0)
+    {
+        if (number >= result + bit)
+        {
+            number -= result + bit;
+            result = (result >> 1) + bit;
+        }
+        else
+        {
+            result >>= 1;
+        }
+
+        bit >>= 2;
+    }
+
+    return (uint32_t)result;
+}
+
+/* ===== VIBRATION WINDOW ===== */
+
+static void VIB_ResetWindow(void)
+{
+    vib_sum_x = 0;
+    vib_sum_y = 0;
+    vib_sum_z = 0;
+
+    vib_sq_x = 0;
+    vib_sq_y = 0;
+    vib_sq_z = 0;
+
+    vib_count = 0;
+}
+
+/* ===== MPU6050 FIFO RESET ===== */
+
+static uint8_t MPU_FIFO_Reset(void)
+{
+    if (!MPU_WriteReg(0x23, 0x00))
+        return 0;
+
+    if (!MPU_WriteReg(0x6A, 0x00))
+        return 0;
+
+    if (!MPU_WriteReg(0x6A, 0x04))
+        return 0;
+
+    if (!MPU_WriteReg(0x23, 0x08))
+        return 0;
+
+    if (!MPU_WriteReg(0x6A, 0x40))
+        return 0;
+
+    VIB_ResetWindow();
+
+    return 1;
+}
+
+/* ===== MPU6050 INITIALIZATION ===== */
+
+static uint8_t MPU_FIFO_Init(void)
+{
+    if (!MPU_WriteReg(0x6B, 0x01))
+        return 0;
+
+    HAL_Delay(50);
+
+    if (!MPU_WriteReg(0x1A, 0x02))
+        return 0;
+
+    if (!MPU_WriteReg(0x19, 0x04))
+        return 0;
+
+    if (!MPU_WriteReg(0x1C, 0x00))
+        return 0;
+
+    if (!MPU_FIFO_Reset())
+        return 0;
+
+    vib_ready = 0;
+
+    return 1;
+}
+
+/* ===== ADD VIBRATION SAMPLE ===== */
+
+static void VIB_AddSample(int16_t x, int16_t y, int16_t z)
+{
+    vib_sum_x += x;
+    vib_sum_y += y;
+    vib_sum_z += z;
+
+    vib_sq_x += (int64_t)x * x;
+    vib_sq_y += (int64_t)y * y;
+    vib_sq_z += (int64_t)z * z;
+
+    vib_count++;
+
+    mon_ax = ((int32_t)x * 1000) / 16384;
+    mon_ay = ((int32_t)y * 1000) / 16384;
+    mon_az = ((int32_t)z * 1000) / 16384;
+
+    if (vib_count >= VIB_WINDOW)
+    {
+        int64_t n = vib_count;
+
+        int64_t numerator =
+            (vib_sq_x + vib_sq_y + vib_sq_z) * n
+            - vib_sum_x * vib_sum_x
+            - vib_sum_y * vib_sum_y
+            - vib_sum_z * vib_sum_z;
+
+        if (numerator < 0)
+            numerator = 0;
+
+        uint32_t root = VIB_Sqrt64((uint64_t)numerator);
+
+        vib_rms_mg = (uint32_t)(
+            ((uint64_t)root * 1000U) /
+            ((uint64_t)vib_count * 16384U)
+        );
+
+        vib_ready = 1;
+
+        VIB_ResetWindow();
+    }
+}
+
+/* ===== MPU6050 FIFO TASK ===== */
+
+static void MPU_FIFO_Task(void)
+{
+    if (!mpu6050_found)
+        return;
+
+    if (!mon_mpu_ok)
+    {
+        uint32_t now = HAL_GetTick();
+
+        if ((uint32_t)(now - mpu_retry_ms) >= 1000U)
+        {
+            mpu_retry_ms = now;
+            mon_mpu_ok = MPU_FIFO_Init();
+        }
+
+        return;
+    }
+
+    uint8_t count_data[2];
+
+    if (HAL_I2C_Mem_Read(
+        &hi2c1,
+        MPU6050_ADDR,
+        0x72,
+        I2C_MEMADD_SIZE_8BIT,
+        count_data,
+        2,
+        100
+    ) != HAL_OK)
+    {
+        mon_mpu_ok = 0;
+        vib_ready = 0;
+        return;
+    }
+
+    uint16_t fifo_bytes =
+        ((uint16_t)count_data[0] << 8) | count_data[1];
+
+    if (fifo_bytes >= 1008U)
+    {
+        vib_fifo_overflows++;
+
+        if (!MPU_FIFO_Reset())
+            mon_mpu_ok = 0;
+
+        vib_ready = 0;
+        return;
+    }
+
+    uint16_t available = fifo_bytes / 6U;
+
+    while (available > 0)
+    {
+        uint16_t batch =
+            (available > VIB_BATCH) ? VIB_BATCH : available;
+
+        uint8_t data[VIB_BATCH * 6U];
+
+        if (HAL_I2C_Mem_Read(
+            &hi2c1,
+            MPU6050_ADDR,
+            0x74,
+            I2C_MEMADD_SIZE_8BIT,
+            data,
+            (uint16_t)(batch * 6U),
+            200
+        ) != HAL_OK)
+        {
+            mon_mpu_ok = 0;
+            vib_ready = 0;
+            return;
+        }
+
+        for (uint16_t i = 0; i < batch; i++)
+        {
+            uint16_t p = i * 6U;
+
+            int16_t x = (int16_t)(
+                ((uint16_t)data[p] << 8) | data[p + 1]
+            );
+
+            int16_t y = (int16_t)(
+                ((uint16_t)data[p + 2] << 8) | data[p + 3]
+            );
+
+            int16_t z = (int16_t)(
+                ((uint16_t)data[p + 4] << 8) | data[p + 5]
+            );
+
+            VIB_AddSample(x, y, z);
+        }
+
+        available -= batch;
+    }
+}
+
+/* ===== RS485 TELEMETRY ===== */
+
+static void RS485_SendTelemetry(void)
+{
+    char bus[16];
+    char current[16];
+    char temp[16];
+    char rms[16];
+    char frame[128];
+
+    /* INA219 */
+
+    if (mon_ina_ok)
+    {
+        snprintf(
+            bus, sizeof(bus), "%lu",
+            (unsigned long)mon_bus_mv
+        );
+
+        snprintf(
+            current, sizeof(current), "%ld",
+            (long)mon_current_ma
+        );
+    }
+    else
+    {
+        snprintf(bus, sizeof(bus), "NA");
+        snprintf(current, sizeof(current), "NA");
+    }
+
+    /* DS18B20 */
+
+    if (mon_temp_ok)
+    {
+        snprintf(
+            temp, sizeof(temp), "%ld",
+            (long)mon_temp10
+        );
+    }
+    else
+    {
+        snprintf(temp, sizeof(temp), "NA");
+    }
+
+    /* MPU6050 */
+
+    if (mon_mpu_ok && vib_ready)
+    {
+        snprintf(
+            rms, sizeof(rms), "%lu",
+            (unsigned long)vib_rms_mg
+        );
+    }
+    else
+    {
+        snprintf(rms, sizeof(rms), "NA");
+    }
+
+    /* Build CSV telemetry frame */
+
+    int len = snprintf(
+        frame,
+        sizeof(frame),
+        "MON,%lu,%lu,%s,%s,%s,%s,%lu\r\n",
+        (unsigned long)HAL_GetTick(),
+        (unsigned long)pwm_percent,
+        bus,
+        current,
+        temp,
+        rms,
+        (unsigned long)vib_fifo_overflows
+    );
+
+    if (len <= 0 || len >= (int)sizeof(frame))
+        return;
+
+    /* RS485 transmit mode */
+
+    HAL_GPIO_WritePin(
+        GPIOB,
+        GPIO_PIN_0,
+        GPIO_PIN_SET
+    );
+
+    HAL_Delay(1);
+
+    HAL_UART_Transmit(
+        &huart2,
+        (uint8_t *)frame,
+        (uint16_t)len,
+        200
+    );
+
+    /* RS485 receive mode */
+
+    HAL_GPIO_WritePin(
+        GPIOB,
+        GPIO_PIN_0,
+        GPIO_PIN_RESET
+    );
+}
 
 /* USER CODE END 0 */
 
@@ -358,6 +750,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_I2C1_Init();
   MX_ADC1_Init();
   MX_TIM3_Init();
@@ -365,11 +758,9 @@ int main(void)
   /* USER CODE BEGIN 2 */
   /* ===== MOTOR INITIALIZATION ===== */
 
-  /* Motor OFF at startup */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
 
-  /* Start PWM at 0% */
   __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
 
   if (HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1) != HAL_OK)
@@ -381,94 +772,63 @@ int main(void)
 
   ssd1306_Init();
 
-  /* ===== CHECK I2C SENSORS ===== */
-
-  ina219_found =
-      (HAL_I2C_IsDeviceReady(
-          &hi2c1, 0x40 << 1, 3, 100) == HAL_OK);
-
-  mpu6050_found =
-      (HAL_I2C_IsDeviceReady(
-          &hi2c1, 0x68 << 1, 3, 100) == HAL_OK);
-
-  /* ===== MPU6050 INITIALIZATION ===== */
-
-  /* Wake up MPU6050 */
-  uint8_t mpu_cfg = 0x00;
-
-  if (mpu6050_found)
-  {
-      HAL_I2C_Mem_Write(
-          &hi2c1,
-          0x68 << 1,
-          0x6B,
-          I2C_MEMADD_SIZE_8BIT,
-          &mpu_cfg,
-          1,
-          100
-      );
-
-      HAL_Delay(100);
-
-      /* Accelerometer range +/-2g */
-      HAL_I2C_Mem_Write(
-          &hi2c1,
-          0x68 << 1,
-          0x1C,
-          I2C_MEMADD_SIZE_8BIT,
-          &mpu_cfg,
-          1,
-          100
-      );
-  }
-
-  /* ===== INA219 INITIALIZATION ===== */
-
-
-  /* ===== INA219 INITIALIZATION ===== */
-
-  /* 32V range, 320mV shunt, continuous mode */
-  uint8_t ina_cfg[2] = {0x39, 0x9F};
-
-  /* For R100 shunt (0.1 Ohm):
-     Current LSB = 0.1 mA
-     Calibration = 4096 */
-  uint8_t ina_cal[2] = {0x10, 0x00};
-
-  if (ina219_found)
-  {
-      HAL_I2C_Mem_Write(
-          &hi2c1, 0x40 << 1, 0x00,
-          I2C_MEMADD_SIZE_8BIT,
-          ina_cfg, 2, 100
-      );
-
-      HAL_I2C_Mem_Write(
-          &hi2c1, 0x40 << 1, 0x05,
-          I2C_MEMADD_SIZE_8BIT,
-          ina_cal, 2, 100
-      );
-  }
-
   /* ===== DS18B20 INITIALIZATION ===== */
 
-  /* Enable DWT microsecond timer */
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
 
   DWT->CYCCNT = 0;
   DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-  /* Release 1-Wire data line A8 */
-  HAL_GPIO_WritePin(
-      GPIOA,
-      GPIO_PIN_8,
-      GPIO_PIN_SET
-  );
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
 
-  /* Schedule first temperature measurement */
   mon_ds_stamp = HAL_GetTick() - 1000U;
 
-  /* ===== INITIAL DISPLAY ===== */
+  /* ===== CHECK I2C DEVICES ===== */
+
+  ina219_found =
+      (HAL_I2C_IsDeviceReady(
+          &hi2c1, INA219_ADDR, 3, 100
+      ) == HAL_OK);
+
+  mpu6050_found =
+      (HAL_I2C_IsDeviceReady(
+          &hi2c1, MPU6050_ADDR, 3, 100
+      ) == HAL_OK);
+
+  /* ===== INA219 INITIALIZATION ===== */
+
+  uint8_t ina_cfg[2] = {0x39, 0x9F};
+
+  if (ina219_found)
+  {
+      if (HAL_I2C_Mem_Write(
+          &hi2c1,
+          INA219_ADDR,
+          0x00,
+          I2C_MEMADD_SIZE_8BIT,
+          ina_cfg,
+          2,
+          100
+      ) != HAL_OK)
+      {
+          ina219_found = 0;
+      }
+  }
+
+  /* ===== MPU6050 INITIALIZATION ===== */
+
+  if (mpu6050_found)
+  {
+      mon_mpu_ok = MPU_FIFO_Init();
+  }
+  else
+  {
+      mon_mpu_ok = 0;
+  }
+
+  mpu_retry_ms = HAL_GetTick();
+
+  /* ===== INITIAL SCREEN ===== */
 
   ssd1306_Fill(Black);
 
@@ -481,16 +841,25 @@ int main(void)
 
   ssd1306_SetCursor(0, 20);
   ssd1306_WriteString(
-      "INITIALIZING...",
+      "SENSORS INIT...",
       Font_6x8,
       White
   );
 
   ssd1306_UpdateScreen();
 
-  HAL_Delay(1000);
+  HAL_Delay(500);
 
+  /* ===== RS485 INITIALIZATION ===== */
 
+  /* B0 LOW = receive mode */
+  HAL_GPIO_WritePin(
+      GPIOB,
+      GPIO_PIN_0,
+      GPIO_PIN_RESET
+  );
+
+  telemetry_last_ms = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -500,8 +869,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
-
 	  /* ===== READ POTENTIOMETER ===== */
 
 	  uint32_t target_pwm = 0;
@@ -511,16 +878,15 @@ int main(void)
 	      if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
 	      {
 	          adc_value = HAL_ADC_GetValue(&hadc1);
-
 	          pot_percent = (adc_value * 100U) / 4095U;
-
 	          target_pwm = pot_percent;
 	      }
 
 	      HAL_ADC_Stop(&hadc1);
 	  }
 
-	  /* Stop command at low potentiometer position */
+	  /* Dead zone: 0-5% */
+
 	  if (target_pwm <= 5U)
 	  {
 	      target_pwm = 0;
@@ -531,13 +897,11 @@ int main(void)
 	  if (pwm_percent < target_pwm)
 	  {
 	      uint32_t step = target_pwm - pwm_percent;
-
 	      pwm_percent += (step > 5U) ? 5U : step;
 	  }
 	  else if (pwm_percent > target_pwm)
 	  {
 	      uint32_t step = pwm_percent - target_pwm;
-
 	      pwm_percent -= (step > 5U) ? 5U : step;
 	  }
 
@@ -545,17 +909,25 @@ int main(void)
 
 	  if (pwm_percent == 0U)
 	  {
-	      /* Motor STOP */
 	      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, 0);
 
-	      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_RESET);
-	      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
+	      HAL_GPIO_WritePin(
+	          GPIOB, GPIO_PIN_9, GPIO_PIN_RESET
+	      );
+
+	      HAL_GPIO_WritePin(
+	          GPIOB, GPIO_PIN_5, GPIO_PIN_RESET
+	      );
 	  }
 	  else
 	  {
-	      /* Motor forward */
-	      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, GPIO_PIN_SET);
-	      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
+	      HAL_GPIO_WritePin(
+	          GPIOB, GPIO_PIN_9, GPIO_PIN_SET
+	      );
+
+	      HAL_GPIO_WritePin(
+	          GPIOB, GPIO_PIN_5, GPIO_PIN_RESET
+	      );
 
 	      uint32_t period =
 	          __HAL_TIM_GET_AUTORELOAD(&htim3) + 1U;
@@ -564,149 +936,185 @@ int main(void)
 	          (pwm_percent * period) / 100U;
 
 	      __HAL_TIM_SET_COMPARE(
-	          &htim3, TIM_CHANNEL_1, compare
+	          &htim3,
+	          TIM_CHANNEL_1,
+	          compare
 	      );
 	  }
 
 	  /* ===== READ SENSORS ===== */
 
-	  /* DS18B20 temperature */
+	  /* DS18B20 */
+
 	  MON_DS18B20_Task();
 
-	  /* MPU6050 acceleration */
-	  MON_ReadMPU();
+	  /* MPU6050 FIFO */
 
-	  /* INA219 voltage and current */
-	  MON_ReadINA();
+	  MPU_FIFO_Task();
 
-	  /* ===== OLED DISPLAY ===== */
+	  /* INA219 every 100 ms */
 
-	  char line[32];
+	  static uint32_t ina_last = 0;
+	  uint32_t now = HAL_GetTick();
 
-	  ssd1306_Fill(Black);
-
-	  /* PWM */
-	  snprintf(line, sizeof(line), "PWM:%lu%%",
-	           (unsigned long)pwm_percent);
-
-	  ssd1306_SetCursor(0, 0);
-	  ssd1306_WriteString(line, Font_6x8, White);
-
-	  /* Temperature */
-	  if (mon_temp_ok)
+	  if ((uint32_t)(now - ina_last) >= 100U)
 	  {
-	      int32_t abs_temp =
-	          (mon_temp10 < 0) ? -mon_temp10 : mon_temp10;
+	      ina_last = now;
 
-	      snprintf(line, sizeof(line), "TEMP:%s%ld.%ld C",
-	               (mon_temp10 < 0) ? "-" : "",
-	               (long)(abs_temp / 10),
-	               (long)(abs_temp % 10));
-	  }
-	  else
-	  {
-	      snprintf(line, sizeof(line), "TEMP: WAIT/ERR");
+	      if (ina219_found)
+	      {
+	          MON_ReadINA();
+	      }
+	      else
+	      {
+	          mon_ina_ok = 0;
+	      }
 	  }
 
-	  ssd1306_SetCursor(0, 9);
-	  ssd1306_WriteString(line, Font_6x8, White);
+	  /* ===== OLED EVERY 200 MS ===== */
 
-	  /* INA219 bus voltage */
-	  if (mon_ina_ok)
+	  static uint32_t oled_last = 0;
+
+	  if ((uint32_t)(now - oled_last) >= 200U)
 	  {
-	      snprintf(line, sizeof(line), "BUS:%lumV",
-	               (unsigned long)mon_bus_mv);
-	  }
-	  else
-	  {
-	      snprintf(line, sizeof(line), "BUS: ERROR");
-	  }
+	      oled_last = now;
 
-	  ssd1306_SetCursor(0, 18);
-	  ssd1306_WriteString(line, Font_6x8, White);
+	      char line[32];
 
+	      ssd1306_Fill(Black);
 
-	  /* ===== INA219 CURRENT DIAGNOSTIC ===== */
-
-	  uint16_t shunt_raw = 0;
-
-	  /* Read actual shunt voltage register */
-	  if (MON_INAReg(0x01, &shunt_raw))
-	  {
-	      int16_t shunt_signed = (int16_t)shunt_raw;
-
-	      /* R100 shunt = 0.1 Ohm
-	         1 bit = 10 uV = 0.1 mA */
-	      int32_t current_ma = shunt_signed / 10;
+	      /* PWM */
 
 	      snprintf(
-	          line,
-	          sizeof(line),
-	          "I:%ldmA S:%d",
-	          (long)current_ma,
-	          (int)shunt_signed
+	          line, sizeof(line),
+	          "PWM:%lu%%",
+	          (unsigned long)pwm_percent
 	      );
-	  }
-	  else
-	  {
+
+	      ssd1306_SetCursor(0, 0);
+	      ssd1306_WriteString(line, Font_6x8, White);
+
+	      /* TEMPERATURE */
+
+	      if (mon_temp_ok)
+	      {
+	          int32_t t = (mon_temp10 < 0)
+	              ? -mon_temp10 : mon_temp10;
+
+	          snprintf(
+	              line, sizeof(line),
+	              "TEMP:%s%ld.%ld C",
+	              (mon_temp10 < 0) ? "-" : "",
+	              (long)(t / 10),
+	              (long)(t % 10)
+	          );
+	      }
+	      else
+	      {
+	          snprintf(line, sizeof(line), "TEMP: WAIT/ERR");
+	      }
+
+	      ssd1306_SetCursor(0, 9);
+	      ssd1306_WriteString(line, Font_6x8, White);
+
+	      /* BUS VOLTAGE */
+
+	      if (mon_ina_ok)
+	      {
+	          snprintf(
+	              line, sizeof(line),
+	              "BUS:%lumV",
+	              (unsigned long)mon_bus_mv
+	          );
+	      }
+	      else
+	      {
+	          snprintf(line, sizeof(line), "BUS: ERROR");
+	      }
+
+	      ssd1306_SetCursor(0, 18);
+	      ssd1306_WriteString(line, Font_6x8, White);
+
+	      /* CURRENT */
+
+	      if (mon_ina_ok)
+	      {
+	          snprintf(
+	              line, sizeof(line),
+	              "I:%ldmA S:%d",
+	              (long)mon_current_ma,
+	              (int)mon_shunt_raw
+	          );
+	      }
+	      else
+	      {
+	          snprintf(line, sizeof(line), "INA219 ERROR");
+	      }
+
+	      ssd1306_SetCursor(0, 27);
+	      ssd1306_WriteString(line, Font_6x8, White);
+
+	      /* VIBRATION RMS */
+
+	      if (mon_mpu_ok && vib_ready)
+	      {
+	          snprintf(
+	              line, sizeof(line),
+	              "RMS:%lumg OF:%lu",
+	              (unsigned long)vib_rms_mg,
+	              (unsigned long)vib_fifo_overflows
+	          );
+	      }
+	      else
+	      {
+	          snprintf(line, sizeof(line), "VIB: WAIT/ERR");
+	      }
+
+	      ssd1306_SetCursor(0, 36);
+	      ssd1306_WriteString(line, Font_6x8, White);
+
+	      /* ACCELERATION X/Y */
+
 	      snprintf(
-	          line,
-	          sizeof(line),
-	          "INA219 ERROR"
+	          line, sizeof(line),
+	          "AX:%ld AY:%ld",
+	          (long)mon_ax,
+	          (long)mon_ay
 	      );
+
+	      ssd1306_SetCursor(0, 45);
+	      ssd1306_WriteString(line, Font_6x8, White);
+
+	      /* ACCELERATION Z */
+
+	      snprintf(
+	          line, sizeof(line),
+	          "AZ:%ldmg",
+	          (long)mon_az
+	      );
+
+	      ssd1306_SetCursor(0, 54);
+	      ssd1306_WriteString(line, Font_6x8, White);
+
+	      ssd1306_UpdateScreen();
 	  }
 
-	  ssd1306_SetCursor(0, 27);
-	  ssd1306_WriteString(line, Font_6x8, White);
+	  /* ===== RS485 TELEMETRY EVERY 500 MS ===== */
 
-	  /* MPU6050 X */
-	  if (mon_mpu_ok)
+	  uint32_t telemetry_now = HAL_GetTick();
+
+	  if ((uint32_t)(telemetry_now - telemetry_last_ms) >= 500U)
 	  {
-	      snprintf(line, sizeof(line), "X:%ldmg",
-	               (long)mon_ax);
-	  }
-	  else
-	  {
-	      snprintf(line, sizeof(line), "MPU: ERROR");
+	      telemetry_last_ms = telemetry_now;
+
+	      RS485_SendTelemetry();
 	  }
 
-	  ssd1306_SetCursor(0, 36);
-	  ssd1306_WriteString(line, Font_6x8, White);
+	  /* ===== MAIN LOOP DELAY ===== */
 
-	  /* MPU6050 Y */
-	  if (mon_mpu_ok)
-	  {
-	      snprintf(line, sizeof(line), "Y:%ldmg",
-	               (long)mon_ay);
-	  }
-	  else
-	  {
-	      snprintf(line, sizeof(line), "Y:---");
-	  }
-
-	  ssd1306_SetCursor(0, 45);
-	  ssd1306_WriteString(line, Font_6x8, White);
-
-	  /* MPU6050 Z */
-	  if (mon_mpu_ok)
-	  {
-	      snprintf(line, sizeof(line), "Z:%ldmg",
-	               (long)mon_az);
-	  }
-	  else
-	  {
-	      snprintf(line, sizeof(line), "Z:---");
-	  }
-
-	  ssd1306_SetCursor(0, 54);
-	  ssd1306_WriteString(line, Font_6x8, White);
-
-	  ssd1306_UpdateScreen();
-
-	  /* ===== LOOP DELAY ===== */
-
-	  HAL_Delay(100);
+	  HAL_Delay(10);
   }
+
   /* USER CODE END 3 */
 }
 
@@ -916,6 +1324,22 @@ static void MX_USART2_UART_Init(void)
   /* USER CODE BEGIN USART2_Init 2 */
 
   /* USER CODE END USART2_Init 2 */
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream5_IRQn);
 
 }
 
